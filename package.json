@@ -1,0 +1,12 @@
+{
+  "name": "opencode-telegram-bridge",
+  "version": "1.0.0",
+  "description": "Bidirectional OpenCode-Telegram bridge - no deployment required",
+  "private": true,
+  "scripts": {
+    "build": "cd plugin && npm run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.8.2"
+  }
+}

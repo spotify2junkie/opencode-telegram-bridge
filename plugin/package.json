@@ -1,0 +1,15 @@
+{
+  "name": "opencode-telegram-bridge-plugin",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsup"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.2.10",
+    "@opencode-ai/sdk": "^1.2.10",
+    "tsup": "^8.5.0",
+    "typescript": "^5.8.2"
+  }
+}
