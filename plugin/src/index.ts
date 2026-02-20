@@ -50,13 +50,47 @@ function log(client: ReturnType<typeof import("@opencode-ai/sdk").createOpencode
 }
 
 async function sendTelegramMessage(botToken: string, chatId: number, text: string): Promise<boolean> {
+  const MAX_LENGTH = 4000;
   const url = `${TELEGRAM_API_BASE}${botToken}/sendMessage`;
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
-  });
-  return res.ok;
+  
+  if (text.length <= MAX_LENGTH) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text, parse_mode: "Markdown" }),
+    });
+    return res.ok;
+  }
+  
+  // Split long messages
+  const chunks: string[] = [];
+  let remaining = text;
+  while (remaining.length > 0) {
+    if (remaining.length <= MAX_LENGTH) {
+      chunks.push(remaining);
+      break;
+    }
+    // Try to split at newline
+    let splitIdx = remaining.lastIndexOf("\n", MAX_LENGTH);
+    if (splitIdx < MAX_LENGTH / 2) {
+      splitIdx = remaining.lastIndexOf(" ", MAX_LENGTH);
+    }
+    if (splitIdx < 0) splitIdx = MAX_LENGTH;
+    chunks.push(remaining.slice(0, splitIdx));
+    remaining = remaining.slice(splitIdx).trim();
+  }
+  
+  let allOk = true;
+  for (const chunk of chunks) {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text: chunk, parse_mode: "Markdown" }),
+    });
+    if (!res.ok) allOk = false;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  return allOk;
 }
 
 async function getUpdates(botToken: string, offset?: number): Promise<TelegramUpdate[]> {
@@ -156,10 +190,21 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
 
         try {
           const session = await client.session.get({ path: { id: sessionId } });
-          const messages = await client.session.messages({ path: { id: sessionId } });
+          const messagesRes = await client.session.messages({ path: { id: sessionId } });
+          const messages = messagesRes.data || [];
           
-          const lastUserMsg = [...(messages.data || [])].reverse().find((m: any) => m.info?.role === "user");
+          const lastUserMsg = [...messages].reverse().find((m: any) => m.info?.role === "user");
           const durationMs = lastUserMsg?.info?.time?.created ? Date.now() - lastUserMsg.info.time.created : undefined;
+
+          // Get last assistant message content
+          const lastAssistantMsg = [...messages].reverse().find((m: any) => m.info?.role === "assistant");
+          let assistantContent = "";
+          if (lastAssistantMsg?.parts) {
+            const textParts = lastAssistantMsg.parts
+              .filter((p: any) => p.type === "text")
+              .map((p: any) => p.text);
+            assistantContent = textParts.join("\n");
+          }
 
           let todos: any[] = [];
           try {
@@ -186,10 +231,20 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
             lines.push(`⏱️ Duration: ${formatDuration(durationMs)}`);
           }
 
+          // Add assistant message content
+          if (assistantContent) {
+            lines.push("");
+            lines.push("*Response:*");
+            // Escape markdown special chars
+            const escapedContent = assistantContent
+              .replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
+            lines.push(escapedContent);
+          }
+
           if (todos.length > 0) {
+            lines.push("");
             lines.push(`📝 Progress: ${completed}/${todos.length} tasks`);
             if (pending.length > 0) {
-              lines.push("");
               lines.push("*Pending:*");
               pending.forEach((t) => lines.push(`  • ${t.content}`));
             }
