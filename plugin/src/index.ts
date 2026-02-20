@@ -120,7 +120,7 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
                 path: { id: targetSessionId },
                 body: { parts: [{ type: "text", text }] },
               });
-              await sendTelegramMessage(config.botToken, config.chatId, `✅ Command sent: ${text.substring(0, 50)}...`);
+              await sendTelegramMessage(config.botToken, config.chatId, `✅ Command sent: ${text}`);
             } catch (e) {
               log(client, "error", `Failed to execute command: ${e}`);
             }
@@ -191,7 +191,7 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
             if (pending.length > 0) {
               lines.push("");
               lines.push("*Pending:*");
-              pending.slice(0, 3).forEach((t) => lines.push(`  • ${t.content}`));
+              pending.forEach((t) => lines.push(`  • ${t.content}`));
             }
           }
 
