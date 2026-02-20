@@ -1,5 +1,7 @@
 # OpenCode Telegram Bridge
 
+[中文文档](README.zh-CN.md) | English
+
 Bidirectional communication between OpenCode and Telegram — no deployment required.
 
 ## Features
