@@ -235,10 +235,7 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
           if (assistantContent) {
             lines.push("");
             lines.push("*Response:*");
-            // Escape markdown special chars
-            const escapedContent = assistantContent
-              .replace(/([_*\[\]()~`>#+\-=|{}.!])/g, '\\$1');
-            lines.push(escapedContent);
+            lines.push(assistantContent);
           }
 
           if (todos.length > 0) {
