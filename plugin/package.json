@@ -9,6 +9,7 @@
   "devDependencies": {
     "@opencode-ai/plugin": "^1.2.10",
     "@opencode-ai/sdk": "^1.2.10",
+    "@types/node": "^25.3.2",
     "tsup": "^8.5.0",
     "typescript": "^5.8.2"
   }
