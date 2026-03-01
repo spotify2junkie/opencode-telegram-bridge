@@ -10,6 +10,9 @@ const TELEGRAM_API_BASE = "https://api.telegram.org/bot";
 const TELEGRAM_SEND_RETRIES = 3;
 const COMPLETION_STABILITY_MS = 12000;
 const COMPLETION_RECHECK_MS = 3000;
+const COMPLETION_MAX_EMPTY_RETRIES = 4;
+const STATUS_ACTIVITY_WINDOW_MS = 90000;
+const STATUS_QUIET_WINDOW_MS = 20000;
 
 interface Config {
   botToken: string;
@@ -154,6 +157,39 @@ function formatTimeAgo(timestampMs?: number): string {
   return `${Math.floor(delta / 3_600_000)}h ago`;
 }
 
+function isLikelySubagentTitle(title?: string): boolean {
+  if (!title) return false;
+  const t = title.toLowerCase();
+  return t.includes("subagent") || t.includes("@explore") || t.includes("@librarian") || t.includes("@oracle");
+}
+
+function extractTextContent(parts: any[] | undefined): string {
+  if (!parts) return "";
+  return parts
+    .filter((part: any) => part.type === "text")
+    .map((part: any) => part.text)
+    .join("\n")
+    .trim();
+}
+
+function getLastUserMessageTime(messages: any[]): number | undefined {
+  const lastUser = [...messages].reverse().find((message: any) => message.info?.role === "user");
+  return lastUser?.info?.time?.created;
+}
+
+function getLastAssistantEvidence(messages: any[]): { createdAt?: number; key?: string; content: string } {
+  for (const message of [...messages].reverse()) {
+    if (message.info?.role !== "assistant") continue;
+    const content = extractTextContent(message.parts);
+    const createdAt = message.info?.time?.created;
+    const key = message.id || createdAt;
+    if (content) {
+      return { createdAt, key, content };
+    }
+  }
+  return { content: "" };
+}
+
 export const TelegramBridge: Plugin = async ({ client, directory }) => {
   const config = loadConfig();
   
@@ -168,6 +204,13 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
   const completionTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const completionFingerprints = new Map<string, string>();
   const completionInFlight = new Set<string>();
+  const completionEmptyRetries = new Map<string, number>();
+  const sessionLastActivity = new Map<string, number>();
+  const sessionIdleState = new Map<string, boolean>();
+  const sessionBusyUntil = new Map<string, number>();
+  const sessionLastUserMessageAt = new Map<string, number>();
+  const sessionLastAssistantNonEmptyAt = new Map<string, number>();
+  const sessionLastNotifiedAssistantKey = new Map<string, string>();
 
   const cancelCompletionTimer = (sessionId: string) => {
     const timer = completionTimers.get(sessionId);
@@ -183,6 +226,13 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
     return `${messages.length}::${messageTail}::${todoTail}`;
   };
 
+  const markSessionBusy = (sessionId: string, baseTime = Date.now()) => {
+    sessionLastActivity.set(sessionId, baseTime);
+    sessionIdleState.set(sessionId, false);
+    sessionBusyUntil.set(sessionId, baseTime + STATUS_QUIET_WINDOW_MS);
+    cancelCompletionTimer(sessionId);
+  };
+
   const sendCompletionIfStable = async (sessionId: string) => {
     if (completionInFlight.has(sessionId)) {
       return;
@@ -196,9 +246,30 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
         client.session.todo({ path: { id: sessionId } }).catch(() => ({ error: undefined, data: [] as any[] })),
       ]);
 
+      const title = !sessionA.error && sessionA.data?.title ? sessionA.data.title : undefined;
+      const parentID = !sessionA.error && sessionA.data ? (sessionA.data as any).parentID : undefined;
+      if (typeof parentID === "string" && parentID.length > 0) {
+        completionFingerprints.set(sessionId, "subagent-skipped");
+        completionEmptyRetries.delete(sessionId);
+        log(client, "info", `Skip completion notification for child session ${sessionId}`);
+        return;
+      }
+      if (isLikelySubagentTitle(title)) {
+        completionFingerprints.set(sessionId, "subagent-skipped");
+        completionEmptyRetries.delete(sessionId);
+        log(client, "info", `Skip completion notification for subagent session ${sessionId}`);
+        return;
+      }
+
       const messagesA = messagesResA.data || [];
       const todosA = !todoResA.error && todoResA.data ? todoResA.data : [];
       const fingerprintA = buildFingerprint(messagesA, todosA);
+      const now = Date.now();
+      const busyUntil = sessionBusyUntil.get(sessionId) || 0;
+      if (now < busyUntil) {
+        scheduleCompletionNotification(sessionId);
+        return;
+      }
 
       await new Promise((r) => setTimeout(r, COMPLETION_RECHECK_MS));
 
@@ -220,16 +291,38 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
         return;
       }
 
-      const lastUserMsg = [...messagesB].reverse().find((m: any) => m.info?.role === "user");
-      const durationMs = lastUserMsg?.info?.time?.created ? Date.now() - lastUserMsg.info.time.created : undefined;
+      const lastUserMessageAt = getLastUserMessageTime(messagesB);
+      if (lastUserMessageAt) {
+        sessionLastUserMessageAt.set(sessionId, lastUserMessageAt);
+      }
 
-      const lastAssistantMsg = [...messagesB].reverse().find((m: any) => m.info?.role === "assistant");
-      let assistantContent = "";
-      if (lastAssistantMsg?.parts) {
-        const textParts = lastAssistantMsg.parts
-          .filter((p: any) => p.type === "text")
-          .map((p: any) => p.text);
-        assistantContent = textParts.join("\n");
+      const assistantEvidence = getLastAssistantEvidence(messagesB);
+      if (assistantEvidence.createdAt) {
+        sessionLastAssistantNonEmptyAt.set(sessionId, assistantEvidence.createdAt);
+      }
+
+      const finalLastUserAt = sessionLastUserMessageAt.get(sessionId) || lastUserMessageAt;
+      const finalAssistantAt = sessionLastAssistantNonEmptyAt.get(sessionId) || assistantEvidence.createdAt;
+      const hasAssistantAfterUser =
+        typeof finalAssistantAt === "number" && typeof finalLastUserAt === "number"
+          ? finalAssistantAt > finalLastUserAt
+          : typeof finalAssistantAt === "number";
+
+      if (!hasAssistantAfterUser || !assistantEvidence.content) {
+        const retryCount = (completionEmptyRetries.get(sessionId) || 0) + 1;
+        if (retryCount <= COMPLETION_MAX_EMPTY_RETRIES) {
+          completionEmptyRetries.set(sessionId, retryCount);
+          scheduleCompletionNotification(sessionId);
+          log(client, "info", `Waiting for assistant final content for ${sessionId}, retry ${retryCount}/${COMPLETION_MAX_EMPTY_RETRIES}`);
+          return;
+        }
+      }
+
+      const durationMs = finalLastUserAt ? Date.now() - finalLastUserAt : undefined;
+      const assistantContent = assistantEvidence.content;
+      const assistantKey = assistantEvidence.key ? String(assistantEvidence.key) : undefined;
+      if (assistantKey && sessionLastNotifiedAssistantKey.get(sessionId) === assistantKey) {
+        return;
       }
 
       const completed = todosB.filter((t: any) => t.status === "completed").length;
@@ -275,6 +368,11 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
       }
 
       completionFingerprints.set(sessionId, fingerprintB);
+      completionEmptyRetries.delete(sessionId);
+      if (assistantKey) {
+        sessionLastNotifiedAssistantKey.set(sessionId, assistantKey);
+      }
+      currentSessionId = sessionId;
       log(client, "info", `Completion notification sent to Telegram for session ${sessionId}`);
     } catch (e) {
       log(client, "error", `Failed to send notification: ${e}`);
@@ -303,22 +401,47 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
       const messages = messagesRes.data || [];
       const todos = !todoRes.error && todoRes.data ? todoRes.data : [];
       const fingerprint = buildFingerprint(messages, todos);
+      const parentID = !sessionRes.error && sessionRes.data ? (sessionRes.data as any).parentID : undefined;
+      const isChildSession = typeof parentID === "string" && parentID.length > 0;
       const pending = todos.filter((t: any) => t.status === "pending");
       const completed = todos.filter((t: any) => t.status === "completed").length;
-      const lastAssistant = [...messages].reverse().find((m: any) => m.info?.role === "assistant");
-      const lastUser = [...messages].reverse().find((m: any) => m.info?.role === "user");
-      const lastAssistantCreated = lastAssistant?.info?.time?.created;
-      const lastUserCreated = lastUser?.info?.time?.created;
+      const assistantEvidence = getLastAssistantEvidence(messages);
+      const lastAssistantCreated = assistantEvidence.createdAt;
+      const lastUserCreated = getLastUserMessageTime(messages);
+      if (lastUserCreated) {
+        sessionLastUserMessageAt.set(sessionId, lastUserCreated);
+      }
+      if (lastAssistantCreated) {
+        sessionLastAssistantNonEmptyAt.set(sessionId, lastAssistantCreated);
+      }
+      const lastActivity = sessionLastActivity.get(sessionId) || Math.max(lastAssistantCreated || 0, lastUserCreated || 0);
+      const recentlyActive = Date.now() - lastActivity <= STATUS_ACTIVITY_WINDOW_MS;
+      const isIdle = sessionIdleState.get(sessionId) === true;
+      const busyUntil = sessionBusyUntil.get(sessionId) || 0;
+      const busyByWindow = Date.now() < busyUntil;
+      const hasAssistantAfterUser =
+        typeof lastAssistantCreated === "number" && typeof lastUserCreated === "number"
+          ? lastAssistantCreated > lastUserCreated
+          : typeof lastAssistantCreated === "number";
 
-      let state = "IDLE";
+      let state = "QUIET (unconfirmed)";
       if (completionInFlight.has(sessionId)) {
         state = "FINALIZING";
       } else if (completionTimers.has(sessionId)) {
         state = "STABILIZING";
-      } else if (pending.length > 0) {
-        state = "RUNNING";
+      } else if (pending.length > 0 || recentlyActive || !isIdle || busyByWindow || !hasAssistantAfterUser) {
+        state = "BUSY";
       } else if (completionFingerprints.get(sessionId) === fingerprint) {
         state = "COMPLETED (notified)";
+      } else if (isIdle) {
+        state = "IDLE (quiet)";
+      }
+
+      let confidence = "medium";
+      if (state === "COMPLETED (notified)" || state === "FINALIZING") {
+        confidence = "high";
+      } else if (state === "QUIET (unconfirmed)" || state === "IDLE (quiet)") {
+        confidence = recentlyActive ? "low" : "medium";
       }
 
       const lines = [
@@ -326,13 +449,19 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
         "",
         `Session ID: \`${sessionId}\``,
         `State: *${state}*`,
+        `Confidence: ${confidence}`,
         `Progress: ${completed}/${todos.length || 0} tasks`,
         `Last user input: ${formatTimeAgo(lastUserCreated)}`,
         `Last assistant output: ${formatTimeAgo(lastAssistantCreated)}`,
+        `Recent activity: ${recentlyActive ? "yes" : "no"}`,
       ];
 
       if (!sessionRes.error && sessionRes.data?.title) {
         lines.splice(3, 0, `Title: \`${sessionRes.data.title}\``);
+      }
+
+      if (isChildSession) {
+        lines.splice(4, 0, "Session kind: child/subagent");
       }
 
       if (pending.length > 0) {
@@ -340,17 +469,10 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
         lines.push("*Pending:*\n" + pending.slice(0, 5).map((t: any) => `• ${t.content}`).join("\n"));
       }
 
-      if (lastAssistant?.parts) {
-        const preview = lastAssistant.parts
-          .filter((p: any) => p.type === "text")
-          .map((p: any) => p.text)
-          .join("\n")
-          .slice(0, 300)
-          .trim();
-        if (preview) {
-          lines.push("");
-          lines.push(`Preview: ${preview}${preview.length >= 300 ? "..." : ""}`);
-        }
+      const preview = assistantEvidence.content.slice(0, 300).trim();
+      if (preview) {
+        lines.push("");
+        lines.push(`Preview: ${preview}${preview.length >= 300 ? "..." : ""}`);
       }
 
       return lines.join("\n");
@@ -410,6 +532,9 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
                 path: { id: targetSessionId },
                 body: { parts: [{ type: "text", text }] },
               });
+              currentSessionId = targetSessionId;
+              markSessionBusy(targetSessionId);
+              sessionLastUserMessageAt.set(targetSessionId, Date.now());
               await sendTelegramMessage(config.botToken, config.chatId, `✅ Command sent: ${text}`);
             } catch (e) {
               log(client, "error", `Failed to execute command: ${e}`);
@@ -446,15 +571,16 @@ export const TelegramBridge: Plugin = async ({ client, directory }) => {
           : undefined;
 
       if (typeof maybeSessionId === "string") {
-        currentSessionId = maybeSessionId;
+        sessionLastActivity.set(maybeSessionId, Date.now());
         if (event.type !== "session.idle") {
-          cancelCompletionTimer(maybeSessionId);
+          markSessionBusy(maybeSessionId);
         }
       }
 
       if (event.type === "session.idle") {
         const sessionId = event.properties.sessionID;
-        currentSessionId = sessionId;
+        sessionLastActivity.set(sessionId, Date.now());
+        sessionIdleState.set(sessionId, true);
         scheduleCompletionNotification(sessionId);
       }
     },

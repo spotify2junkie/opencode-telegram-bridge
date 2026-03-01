@@ -69,13 +69,27 @@ Examples:
 - Reply "run the tests"
 - Reply "commit these changes"
 
+### Checking Runtime Status
+
+- Send `/status` to check the currently tracked session
+- Send `/status <session_id>` to check a specific session
+- Send `/help` to see available commands
+
+Status output is intentionally conservative:
+- `BUSY` means recent activity or pending work is detected
+- `STABILIZING` / `FINALIZING` means completion is being verified
+- `IDLE (quiet)` means no recent activity signal was observed (not a hard guarantee of terminal completion)
+- `COMPLETED (notified)` means a completion notification was already sent for the current stable fingerprint
+
 ## How It Works
 
-1. The plugin listens for `session.idle` events from OpenCode
-2. When triggered, it fetches session details, todos, and the last assistant response
-3. Sends a formatted notification to your Telegram
-4. Continuously polls Telegram for replies to your notifications
-5. When you reply, the message is sent to OpenCode via `session.prompt` API
+1. The plugin listens for OpenCode session events and tracks activity per session
+2. On `session.idle`, it waits through a stability window and rechecks before notifying
+3. It skips child/subagent sessions and only sends completion after stable verification
+4. It fetches session details, todos, and the last assistant response for the final notification
+5. Sends a formatted notification to your Telegram
+6. Continuously polls Telegram for replies and command messages
+7. When you reply, the message is sent to OpenCode via `session.prompt` API
 
 ## Security
 
